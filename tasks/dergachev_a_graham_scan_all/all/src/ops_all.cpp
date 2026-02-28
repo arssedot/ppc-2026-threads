@@ -84,8 +84,9 @@ std::vector<Point> GrahamScan(std::vector<Point> pts) {
 std::vector<double> Flatten(const std::vector<Point> &pts) {
   std::vector<double> flat(pts.size() * 2);
   for (int i = 0; std::cmp_less(i, pts.size()); i++) {
-    flat[2 * i] = pts[i].x;
-    flat[2 * i + 1] = pts[i].y;
+    auto idx = static_cast<size_t>(i) * 2;
+    flat[idx] = pts[i].x;
+    flat[idx + 1] = pts[i].y;
   }
   return flat;
 }
@@ -94,10 +95,15 @@ std::vector<Point> Unflatten(const std::vector<double> &flat) {
   int count = static_cast<int>(flat.size()) / 2;
   std::vector<Point> pts(count);
   for (int i = 0; i < count; i++) {
-    pts[i].x = flat[2 * i];
-    pts[i].y = flat[2 * i + 1];
+    auto idx = static_cast<size_t>(i) * 2;
+    pts[i].x = flat[idx];
+    pts[i].y = flat[idx + 1];
   }
   return pts;
+}
+
+int ChunkSize(int idx, int total, int parts) {
+  return (total / parts) + ((idx < (total % parts)) ? 1 : 0);
 }
 
 std::vector<Point> GrahamScanThreaded(const std::vector<Point> &pts) {
@@ -114,14 +120,12 @@ std::vector<Point> GrahamScanThreaded(const std::vector<Point> &pts) {
   }
   std::vector<std::vector<Point>> thread_hulls(num_threads);
   std::vector<std::thread> threads;
-  int chunk = n / num_threads;
-  int remainder = n % num_threads;
   int offset = 0;
-  for (int t = 0; t < num_threads; t++) {
-    int sz = chunk + (t < remainder ? 1 : 0);
-    threads.emplace_back([&thread_hulls, &pts, offset, sz, t]() {
+  for (int ti = 0; ti < num_threads; ti++) {
+    int sz = ChunkSize(ti, n, num_threads);
+    threads.emplace_back([&thread_hulls, &pts, offset, sz, ti]() {
       std::vector<Point> local(pts.begin() + offset, pts.begin() + offset + sz);
-      thread_hulls[t] = GrahamScan(std::move(local));
+      thread_hulls[ti] = GrahamScan(std::move(local));
     });
     offset += sz;
   }
@@ -133,6 +137,58 @@ std::vector<Point> GrahamScanThreaded(const std::vector<Point> &pts) {
     merged.insert(merged.end(), th.begin(), th.end());
   }
   return GrahamScan(std::move(merged));
+}
+
+void SendPoints(const std::vector<Point> &pts, int dest, int tag_sz, int tag_data) {
+  int sz = static_cast<int>(pts.size());
+  MPI_Send(&sz, 1, MPI_INT, dest, tag_sz, MPI_COMM_WORLD);
+  if (sz > 0) {
+    std::vector<double> buf = Flatten(pts);
+    MPI_Send(buf.data(), sz * 2, MPI_DOUBLE, dest, tag_data, MPI_COMM_WORLD);
+  }
+}
+
+std::vector<Point> RecvPoints(int source, int tag_sz, int tag_data) {
+  int sz = 0;
+  MPI_Recv(&sz, 1, MPI_INT, source, tag_sz, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+  if (sz <= 0) {
+    return {};
+  }
+  std::vector<double> buf(static_cast<size_t>(sz) * 2);
+  MPI_Recv(buf.data(), sz * 2, MPI_DOUBLE, source, tag_data, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+  return Unflatten(buf);
+}
+
+std::vector<Point> DistributePoints(int rank, int world_size, const std::vector<Point> &points) {
+  int n = static_cast<int>(points.size());
+  if (rank == 0) {
+    int off = ChunkSize(0, n, world_size);
+    for (int i = 1; i < world_size; i++) {
+      int sz = ChunkSize(i, n, world_size);
+      std::vector<Point> chunk(points.begin() + off, points.begin() + off + sz);
+      SendPoints(chunk, i, 0, 1);
+      off += sz;
+    }
+    return {points.begin(), points.begin() + ChunkSize(0, n, world_size)};
+  }
+  return RecvPoints(0, 0, 1);
+}
+
+std::vector<Point> GatherHulls(int rank, int world_size, const std::vector<Point> &local_hull) {
+  if (rank == 0) {
+    std::vector<Point> all_hull(local_hull);
+    for (int i = 1; i < world_size; i++) {
+      auto rh = RecvPoints(i, 2, 3);
+      all_hull.insert(all_hull.end(), rh.begin(), rh.end());
+    }
+    auto result = GrahamScan(std::move(all_hull));
+    for (int i = 1; i < world_size; i++) {
+      SendPoints(result, i, 4, 5);
+    }
+    return result;
+  }
+  SendPoints(local_hull, 0, 2, 3);
+  return RecvPoints(0, 4, 5);
 }
 
 }  // namespace
@@ -178,7 +234,7 @@ bool DergachevAGrahamScanALL::RunImpl() {
   int n = static_cast<int>(points_.size());
 
   if (n <= 1) {
-    hull_ = points_;
+    hull_.assign(points_.begin(), points_.end());
     return true;
   }
 
@@ -202,77 +258,12 @@ bool DergachevAGrahamScanALL::RunImpl() {
     return true;
   }
 
-  int base = n / world_size;
-  int rem = n % world_size;
-  std::vector<Point> local_chunk;
-
-  if (rank == 0) {
-    int my_sz = base + (0 < rem ? 1 : 0);
-    local_chunk.assign(points_.begin(), points_.begin() + my_sz);
-    int off = my_sz;
-    for (int i = 1; i < world_size; i++) {
-      int sz = base + (i < rem ? 1 : 0);
-      MPI_Send(&sz, 1, MPI_INT, i, 0, MPI_COMM_WORLD);
-      if (sz > 0) {
-        std::vector<double> buf = Flatten({points_.begin() + off, points_.begin() + off + sz});
-        MPI_Send(buf.data(), sz * 2, MPI_DOUBLE, i, 1, MPI_COMM_WORLD);
-      }
-      off += sz;
-    }
-  } else {
-    int sz = 0;
-    MPI_Recv(&sz, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    if (sz > 0) {
-      std::vector<double> buf(sz * 2);
-      MPI_Recv(buf.data(), sz * 2, MPI_DOUBLE, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-      local_chunk = Unflatten(buf);
-    }
-  }
-
+  auto local_chunk = DistributePoints(rank, world_size, points_);
   std::vector<Point> local_hull;
   if (!local_chunk.empty()) {
     local_hull = GrahamScanThreaded(local_chunk);
   }
-
-  if (rank == 0) {
-    std::vector<Point> all_hull(local_hull.begin(), local_hull.end());
-    for (int i = 1; i < world_size; i++) {
-      int hsz = 0;
-      MPI_Recv(&hsz, 1, MPI_INT, i, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-      if (hsz > 0) {
-        std::vector<double> buf(hsz * 2);
-        MPI_Recv(buf.data(), hsz * 2, MPI_DOUBLE, i, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        std::vector<Point> rh = Unflatten(buf);
-        all_hull.insert(all_hull.end(), rh.begin(), rh.end());
-      }
-    }
-    hull_ = GrahamScan(std::move(all_hull));
-
-    int final_sz = static_cast<int>(hull_.size());
-    std::vector<double> flat_hull = Flatten(hull_);
-    for (int i = 1; i < world_size; i++) {
-      MPI_Send(&final_sz, 1, MPI_INT, i, 4, MPI_COMM_WORLD);
-      if (final_sz > 0) {
-        MPI_Send(flat_hull.data(), final_sz * 2, MPI_DOUBLE, i, 5, MPI_COMM_WORLD);
-      }
-    }
-  } else {
-    int hsz = static_cast<int>(local_hull.size());
-    MPI_Send(&hsz, 1, MPI_INT, 0, 2, MPI_COMM_WORLD);
-    if (hsz > 0) {
-      std::vector<double> buf = Flatten(local_hull);
-      MPI_Send(buf.data(), hsz * 2, MPI_DOUBLE, 0, 3, MPI_COMM_WORLD);
-    }
-
-    int final_sz = 0;
-    MPI_Recv(&final_sz, 1, MPI_INT, 0, 4, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    if (final_sz > 0) {
-      std::vector<double> buf(final_sz * 2);
-      MPI_Recv(buf.data(), final_sz * 2, MPI_DOUBLE, 0, 5, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-      hull_ = Unflatten(buf);
-    }
-  }
-
+  hull_ = GatherHulls(rank, world_size, local_hull);
   return true;
 }
 
