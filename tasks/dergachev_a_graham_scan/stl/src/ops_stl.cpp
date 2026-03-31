@@ -51,19 +51,20 @@ int FindPivotParallel(const std::vector<Pt> &pts, int num_threads) {
   std::vector<int> local_results(num_threads);
   std::vector<std::thread> threads;
 
-  for (int t = 0; t < num_threads; t++) {
-    int lo = t * chunk;
-    int hi = (t == num_threads - 1) ? n : ((t + 1) * chunk);
-    threads.emplace_back([&pts, &local_results, t, lo, hi]() { local_results[t] = FindLocalPivot(pts, lo, hi); });
+  for (int thread_idx = 0; thread_idx < num_threads; thread_idx++) {
+    int lo = thread_idx * chunk;
+    int hi = (thread_idx == num_threads - 1) ? n : ((thread_idx + 1) * chunk);
+    threads.emplace_back(
+        [&pts, &local_results, thread_idx, lo, hi]() { local_results[thread_idx] = FindLocalPivot(pts, lo, hi); });
   }
   for (auto &th : threads) {
     th.join();
   }
 
   int best = local_results[0];
-  for (int t = 1; t < num_threads; t++) {
-    if (IsLowerLeft(pts[local_results[t]], pts[best])) {
-      best = local_results[t];
+  for (int thread_idx = 1; thread_idx < num_threads; thread_idx++) {
+    if (IsLowerLeft(pts[local_results[thread_idx]], pts[best])) {
+      best = local_results[thread_idx];
     }
   }
   return best;
@@ -92,9 +93,9 @@ void ParallelSortByAngle(std::vector<Pt> &pts, const Pt &pivot, int num_threads)
   int chunk = sort_count / num_threads;
   std::vector<std::thread> threads;
 
-  for (int t = 0; t < num_threads; t++) {
-    int lo = 1 + (t * chunk);
-    int hi = (t == num_threads - 1) ? n : 1 + ((t + 1) * chunk);
+  for (int thread_idx = 0; thread_idx < num_threads; thread_idx++) {
+    int lo = 1 + (thread_idx * chunk);
+    int hi = (thread_idx == num_threads - 1) ? n : 1 + ((thread_idx + 1) * chunk);
     threads.emplace_back([&pts, lo, hi, &cmp]() { std::sort(pts.begin() + lo, pts.begin() + hi, cmp); });
   }
   for (auto &th : threads) {
@@ -102,8 +103,8 @@ void ParallelSortByAngle(std::vector<Pt> &pts, const Pt &pivot, int num_threads)
   }
 
   int boundary = 1 + chunk;
-  for (int t = 1; t < num_threads; t++) {
-    int next = (t == num_threads - 1) ? n : 1 + ((t + 1) * chunk);
+  for (int thread_idx = 1; thread_idx < num_threads; thread_idx++) {
+    int next = (thread_idx == num_threads - 1) ? n : 1 + ((thread_idx + 1) * chunk);
     std::inplace_merge(pts.begin() + 1, pts.begin() + boundary, pts.begin() + next, cmp);
     boundary = next;
   }
