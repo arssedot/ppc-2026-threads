@@ -88,10 +88,10 @@ std::vector<Pt> ThreadedHull(const std::vector<Pt> &pts) {
   std::vector<std::vector<Pt>> partial(num_threads);
   std::vector<std::thread> workers;
   int off = 0;
-  for (int t = 0; t < num_threads; t++) {
-    int len = ChunkLen(t, n, num_threads);
+  for (int ti = 0; ti < num_threads; ti++) {
+    int len = ChunkLen(ti, n, num_threads);
     workers.emplace_back(
-        [&partial, &pts, off, len, t]() { partial[t] = BuildHull({pts.begin() + off, pts.begin() + off + len}); });
+        [&partial, &pts, off, len, ti]() { partial[ti] = BuildHull({pts.begin() + off, pts.begin() + off + len}); });
     off += len;
   }
   for (auto &w : workers) {
