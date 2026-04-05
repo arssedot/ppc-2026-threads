@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(build/bin/ppc_func_tests.exe --gtest_filter=\"*dergachev_a_graham_scan*\")",
+      "Bash(mpiexec -n 2 build/bin/ppc_func_tests.exe --gtest_filter=\"*dergachev_a_graham_scan*all*\")",
+      "Bash(mpiexec -n 2 build/bin/ppc_perf_tests.exe --gtest_filter=\"*dergachev_a_graham_scan*all*\")"
+    ]
+  }
+}
