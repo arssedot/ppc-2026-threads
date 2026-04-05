@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -84,7 +85,7 @@ std::vector<Pt> ThreadedHull(const std::vector<Pt> &pts, int num_threads) {
   std::vector<std::thread> workers;
   int off = 0;
   for (int ti = 0; ti < num_threads; ti++) {
-    int len = n / num_threads + ((ti < (n % num_threads)) ? 1 : 0);
+    int len = (n / num_threads) + ((ti < (n % num_threads)) ? 1 : 0);
     workers.emplace_back(
         [&partial, &pts, off, len, ti]() { partial[ti] = BuildHull({pts.begin() + off, pts.begin() + off + len}); });
     off += len;
@@ -103,7 +104,7 @@ std::vector<double> Flatten(const std::vector<Pt> &pts) {
   std::vector<double> flat(pts.size() * 2);
   for (size_t i = 0; i < pts.size(); i++) {
     flat[i * 2] = pts[i].first;
-    flat[i * 2 + 1] = pts[i].second;
+    flat[(i * 2) + 1] = pts[i].second;
   }
   return flat;
 }
@@ -111,7 +112,7 @@ std::vector<double> Flatten(const std::vector<Pt> &pts) {
 std::vector<Pt> Unflatten(const std::vector<double> &flat) {
   std::vector<Pt> pts(flat.size() / 2);
   for (size_t i = 0; i < pts.size(); i++) {
-    pts[i] = {flat[i * 2], flat[i * 2 + 1]};
+    pts[i] = {flat[i * 2], flat[(i * 2) + 1]};
   }
   return pts;
 }
@@ -174,7 +175,7 @@ bool DergachevAGrahamScanALL::RunImpl() {
   std::vector<int> send_displs(world_size);
   int disp = 0;
   for (int i = 0; i < world_size; i++) {
-    int chunk = n / world_size + ((i < (n % world_size)) ? 1 : 0);
+    int chunk = (n / world_size) + ((i < (n % world_size)) ? 1 : 0);
     send_counts[i] = chunk * 2;
     send_displs[i] = disp;
     disp += send_counts[i];
@@ -220,7 +221,7 @@ bool DergachevAGrahamScanALL::RunImpl() {
   int hull_size = static_cast<int>(hull_.size());
   MPI_Bcast(&hull_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
   hull_.resize(hull_size);
-  std::vector<double> result_flat(hull_size * 2);
+  std::vector<double> result_flat(static_cast<size_t>(hull_size) * 2);
   if (rank == 0) {
     result_flat = Flatten(hull_);
   }
