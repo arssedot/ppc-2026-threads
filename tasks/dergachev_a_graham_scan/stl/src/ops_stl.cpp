@@ -70,7 +70,7 @@ int FindPivotParallel(const std::vector<Pt> &pts, int num_threads) {
   return best;
 }
 
-void ParallelSortByAngle(std::vector<Pt> &pts, const Pt &pivot, int num_threads) {
+void ParallelSortByAngle(std::vector<Pt> &pts, const Pt pivot, int num_threads) {
   int n = static_cast<int>(pts.size());
   int sort_count = n - 1;
 
@@ -158,7 +158,8 @@ bool DergachevAGrahamScanSTL::RunImpl() {
   int pivot_idx = FindPivotParallel(pts, num_threads);
   std::swap(pts[0], pts[pivot_idx]);
 
-  ParallelSortByAngle(pts, pts[0], num_threads);
+  Pt pivot = pts[0];
+  ParallelSortByAngle(pts, pivot, num_threads);
 
   for (const auto &p : pts) {
     while (hull_.size() > 1 && CrossProduct(hull_[hull_.size() - 2], hull_.back(), p) <= 0.0) {
