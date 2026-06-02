@@ -250,9 +250,8 @@ bool AllPointsSame(const std::vector<Pt> &points) {
   if (points.size() <= 1) {
     return false;
   }
-  return std::all_of(points.begin() + 1, points.end(), [&](const Pt &p) {
-    return p.first == points[0].first && p.second == points[0].second;
-  });
+  return std::all_of(points.begin() + 1, points.end(),
+                     [&](const Pt &p) { return p.first == points[0].first && p.second == points[0].second; });
 }
 
 bool HandleTrivialCases(int rank, int original_size, int all_same, std::vector<Pt> &points, std::vector<Pt> &hull) {
@@ -351,14 +350,13 @@ void GatherSortedAndBuildHull(WorkBuffers &bufs, int rank, int world_size, MPI_D
     return;
   }
 
-  bufs.sorted = MergeAllBlocks(bufs.gathered, bufs.recv_displs, bufs.recv_counts, world_size, global_pivot,
-                               bufs.merge_temp);
+  bufs.sorted =
+      MergeAllBlocks(bufs.gathered, bufs.recv_displs, bufs.recv_counts, world_size, global_pivot, bufs.merge_temp);
   BuildHullFromSorted(bufs.sorted, global_pivot, hull);
 }
 
-void RunDistributedHull(WorkBuffers &bufs, int rank, int world_size, int block_size, int padded_size,
-                        int original_size, MPI_Datatype mpi_point, const std::vector<Pt> &points,
-                        std::vector<Pt> &hull) {
+void RunDistributedHull(WorkBuffers &bufs, int rank, int world_size, int block_size, int padded_size, int original_size,
+                        MPI_Datatype mpi_point, const std::vector<Pt> &points, std::vector<Pt> &hull) {
   PrepareScatterLayout(bufs, world_size, block_size);
   ScatterLocalPoints(bufs, rank, block_size, padded_size, original_size, mpi_point, points);
 
