@@ -401,8 +401,8 @@ bool DergachevAGrahamScanALL::RunImpl() {
               0, MPI_COMM_WORLD);
 
   if (rank == 0) {
-    bufs.sorted = MergeBlocksFromGathered(bufs.gathered, bufs.recv_displs, bufs.recv_counts, 0, world_size,
-                                          global_pivot);
+    bufs.sorted =
+        MergeBlocksFromGathered(bufs.gathered, bufs.recv_displs, bufs.recv_counts, 0, world_size, global_pivot);
     BuildHullFromSorted(bufs.sorted, global_pivot, hull_);
   }
 
