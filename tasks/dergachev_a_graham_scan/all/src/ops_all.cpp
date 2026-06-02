@@ -36,8 +36,6 @@ struct WorkBuffers {
   std::vector<int> recv_counts;
   std::vector<int> recv_displs;
   std::vector<Pt> gathered;
-  std::vector<Pt> merge_left;
-  std::vector<Pt> merge_right;
   std::vector<Pt> sorted;
 };
 
@@ -204,26 +202,25 @@ void MergeTwoSlices(Slice left, Slice right, const Pt &pivot, std::vector<Pt> &o
   }
 }
 
-void MergeBlocksFromGathered(const std::vector<Pt> &gathered, const std::vector<int> &displs,
-                             const std::vector<int> &counts, int left, int right, const Pt &pivot, std::vector<Pt> &out,
-                             WorkBuffers &bufs) {
+std::vector<Pt> MergeBlocksFromGathered(const std::vector<Pt> &gathered, const std::vector<int> &displs,
+                                        const std::vector<int> &counts, int left, int right, const Pt &pivot) {
   if (right - left <= 0) {
-    out.clear();
-    return;
+    return {};
   }
   if (right - left == 1) {
     const int displ = displs[static_cast<size_t>(left)];
     const int count = counts[static_cast<size_t>(left)];
-    out.assign(gathered.begin() + displ, gathered.begin() + displ + count);
-    return;
+    return {gathered.begin() + displ, gathered.begin() + displ + count};
   }
 
   const int mid = left + ((right - left) / 2);
-  MergeBlocksFromGathered(gathered, displs, counts, left, mid, pivot, bufs.merge_left, bufs);
-  MergeBlocksFromGathered(gathered, displs, counts, mid, right, pivot, bufs.merge_right, bufs);
+  std::vector<Pt> merged_left = MergeBlocksFromGathered(gathered, displs, counts, left, mid, pivot);
+  std::vector<Pt> merged_right = MergeBlocksFromGathered(gathered, displs, counts, mid, right, pivot);
 
-  MergeTwoSlices({bufs.merge_left.data(), bufs.merge_left.data() + bufs.merge_left.size()},
-                 {bufs.merge_right.data(), bufs.merge_right.data() + bufs.merge_right.size()}, pivot, out);
+  std::vector<Pt> out;
+  MergeTwoSlices({merged_left.data(), merged_left.data() + merged_left.size()},
+                 {merged_right.data(), merged_right.data() + merged_right.size()}, pivot, out);
+  return out;
 }
 
 void RemovePaddingPoints(std::vector<Pt> &pts) {
@@ -404,17 +401,8 @@ bool DergachevAGrahamScanALL::RunImpl() {
               0, MPI_COMM_WORLD);
 
   if (rank == 0) {
-    if (world_size == 2) {
-      const int d0 = bufs.recv_displs[0];
-      const int c0 = bufs.recv_counts[0];
-      const int d1 = bufs.recv_displs[1];
-      const int c1 = bufs.recv_counts[1];
-      MergeTwoSlices({bufs.gathered.data() + d0, bufs.gathered.data() + d0 + c0},
-                     {bufs.gathered.data() + d1, bufs.gathered.data() + d1 + c1}, global_pivot, bufs.sorted);
-    } else {
-      MergeBlocksFromGathered(bufs.gathered, bufs.recv_displs, bufs.recv_counts, 0, world_size, global_pivot,
-                              bufs.sorted, bufs);
-    }
+    bufs.sorted = MergeBlocksFromGathered(bufs.gathered, bufs.recv_displs, bufs.recv_counts, 0, world_size,
+                                          global_pivot);
     BuildHullFromSorted(bufs.sorted, global_pivot, hull_);
   }
 
