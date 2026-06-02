@@ -18,6 +18,44 @@ namespace {
 
 using Pt = std::pair<double, double>;
 
+constexpr double kPaddingMarker = 1e18;
+
+const double kPi = std::acos(-1.0);
+
+struct Slice {
+  const Pt *begin;
+  const Pt *end;
+};
+
+struct WorkBuffers {
+  std::vector<Pt> padded_input;
+  std::vector<Pt> local_data;
+  std::vector<Pt> gathered_pivots;
+  std::vector<int> counts;
+  std::vector<int> displs;
+  std::vector<int> recv_counts;
+  std::vector<int> recv_displs;
+  std::vector<Pt> gathered;
+  std::vector<Pt> merge_left;
+  std::vector<Pt> merge_right;
+  std::vector<Pt> sorted;
+};
+
+MPI_Datatype GetMpiPointType() {
+  static MPI_Datatype mpi_point = MPI_DATATYPE_NULL;
+  static bool initialized = false;
+  if (!initialized) {
+    MPI_Type_contiguous(2, MPI_DOUBLE, &mpi_point);
+    MPI_Type_commit(&mpi_point);
+    initialized = true;
+  }
+  return mpi_point;
+}
+
+bool IsLowerLeft(const Pt &a, const Pt &b) {
+  return a.second < b.second || (a.second == b.second && a.first < b.first);
+}
+
 double CrossProduct(const Pt &o, const Pt &a, const Pt &b) {
   return ((a.first - o.first) * (b.second - o.second)) - ((a.second - o.second) * (b.first - o.first));
 }
@@ -28,33 +66,40 @@ double DistSquared(const Pt &a, const Pt &b) {
   return (dx * dx) + (dy * dy);
 }
 
-const double kPi = std::acos(-1.0);
-
-bool IsLowerLeft(const Pt &a, const Pt &b) {
-  return a.second < b.second || (a.second == b.second && a.first < b.first);
+bool AngleLessSeq(const Pt &a, const Pt &b, const Pt &pivot) {
+  double cross = CrossProduct(pivot, a, b);
+  if (cross > 0.0) {
+    return true;
+  }
+  if (cross < 0.0) {
+    return false;
+  }
+  return DistSquared(pivot, a) < DistSquared(pivot, b);
 }
 
-int FindPivotIndex(const std::vector<Pt> &pts, int num_threads) {
-  int n = static_cast<int>(pts.size());
-  if (n <= 1) {
+int FindLocalPivotIndex(const std::vector<Pt> &pts) {
+  if (pts.empty()) {
     return 0;
   }
+
+  const int num_threads = ppc::util::GetNumThreads();
+  const int n = static_cast<int>(pts.size());
   if (n < num_threads * 2) {
-    int pivot_idx = 0;
+    int best = 0;
     for (int i = 1; i < n; i++) {
-      if (IsLowerLeft(pts[i], pts[pivot_idx])) {
-        pivot_idx = i;
+      if (IsLowerLeft(pts[i], pts[best])) {
+        best = i;
       }
     }
-    return pivot_idx;
+    return best;
   }
 
   std::vector<int> local_best(num_threads);
 #pragma omp parallel num_threads(num_threads) default(none) shared(pts, n, local_best, num_threads)
   {
-    int tid = omp_get_thread_num();
-    int lo = (tid * n) / num_threads;
-    int hi = ((tid + 1) * n) / num_threads;
+    const int tid = omp_get_thread_num();
+    const int lo = (tid * n) / num_threads;
+    const int hi = ((tid + 1) * n) / num_threads;
     int best = lo;
     for (int i = lo + 1; i < hi; i++) {
       if (IsLowerLeft(pts[i], pts[best])) {
@@ -64,55 +109,44 @@ int FindPivotIndex(const std::vector<Pt> &pts, int num_threads) {
     local_best[tid] = best;
   }
 
-  int pivot_idx = local_best[0];
+  int best = local_best[0];
   for (int t = 1; t < num_threads; t++) {
-    if (IsLowerLeft(pts[local_best[t]], pts[pivot_idx])) {
-      pivot_idx = local_best[t];
+    if (IsLowerLeft(pts[local_best[t]], pts[best])) {
+      best = local_best[t];
     }
   }
-  return pivot_idx;
+  return best;
 }
 
-void ParallelSortByAngle(std::vector<Pt> &pts, const Pt &pivot, int num_threads) {
-  int n = static_cast<int>(pts.size());
-  int sort_count = n - 1;
-
-  auto cmp = [&pivot](const Pt &a, const Pt &b) {
-    double cross = CrossProduct(pivot, a, b);
-    if (cross > 0.0) {
-      return true;
-    }
-    if (cross < 0.0) {
-      return false;
-    }
-    return DistSquared(pivot, a) < DistSquared(pivot, b);
-  };
-
-  if (num_threads <= 1 || sort_count <= num_threads) {
-    std::sort(pts.begin() + 1, pts.end(), cmp);
+void ParallelSortRange(std::vector<Pt>::iterator begin, std::vector<Pt>::iterator end, const Pt &pivot) {
+  const int n = static_cast<int>(end - begin);
+  const int num_threads = ppc::util::GetNumThreads();
+  if (n <= 1 || num_threads <= 1) {
+    std::sort(begin, end, [&](const Pt &a, const Pt &b) { return AngleLessSeq(a, b, pivot); });
     return;
   }
 
-  const int chunk = sort_count / num_threads;
-#pragma omp parallel num_threads(num_threads) default(none) shared(pts, n, chunk, cmp, num_threads)
+  auto cmp = [&](const Pt &a, const Pt &b) { return AngleLessSeq(a, b, pivot); };
+  const int chunk = n / num_threads;
+#pragma omp parallel num_threads(num_threads) default(none) shared(begin, n, chunk, cmp, num_threads)
   {
     const int tid = omp_get_thread_num();
-    const int lo = 1 + (tid * chunk);
-    const int hi = (tid == num_threads - 1) ? n : 1 + ((tid + 1) * chunk);
-    std::sort(pts.begin() + lo, pts.begin() + hi, cmp);
+    const int lo = tid * chunk;
+    const int hi = (tid == num_threads - 1) ? n : (tid + 1) * chunk;
+    std::sort(begin + lo, begin + hi, cmp);
   }
 
-  int boundary = 1 + chunk;
+  int boundary = chunk;
   for (int tid = 1; tid < num_threads; tid++) {
-    const int next = (tid == num_threads - 1) ? n : 1 + ((tid + 1) * chunk);
-    std::inplace_merge(pts.begin() + 1, pts.begin() + boundary, pts.begin() + next, cmp);
+    const int next = (tid == num_threads - 1) ? n : (tid + 1) * chunk;
+    std::inplace_merge(begin, begin + boundary, begin + next, cmp);
     boundary = next;
   }
 }
 
-void BuildHull(std::vector<Pt> &pts, std::vector<Pt> &hull) {
+void BuildHullSequential(std::vector<Pt> &pts, std::vector<Pt> &hull) {
   hull.clear();
-  int n = static_cast<int>(pts.size());
+  const int n = static_cast<int>(pts.size());
   if (n <= 1) {
     if (!pts.empty()) {
       hull.push_back(pts[0]);
@@ -125,58 +159,82 @@ void BuildHull(std::vector<Pt> &pts, std::vector<Pt> &hull) {
     return;
   }
 
-  const int num_threads = ppc::util::GetNumThreads();
-  int pivot = FindPivotIndex(pts, num_threads);
-  std::swap(pts[0], pts[pivot]);
-  ParallelSortByAngle(pts, pts[0], num_threads);
+  const int pivot_idx = FindLocalPivotIndex(pts);
+  std::swap(pts[0], pts[pivot_idx]);
+  const Pt pivot = pts[0];
+  ParallelSortRange(pts.begin() + 1, pts.end(), pivot);
 
   for (const auto &p : pts) {
-    while (hull.size() > 1 && CrossProduct(hull[hull.size() - 2], hull.back(), p) <= 0.0) {
+    while (hull.size() >= 2 && CrossProduct(hull[hull.size() - 2], hull.back(), p) <= 0.0) {
       hull.pop_back();
     }
     hull.push_back(p);
   }
 }
 
-void FlattenInto(const std::vector<Pt> &pts, std::vector<double> &flat) {
-  const size_t count = pts.size();
-  flat.resize(count * 2);
-#pragma omp parallel for default(none) shared(pts, flat, count) num_threads(ppc::util::GetNumThreads())
-  for (int i = 0; i < static_cast<int>(count); i++) {
-    flat[static_cast<size_t>(i) * 2] = pts[i].first;
-    flat[(static_cast<size_t>(i) * 2) + 1] = pts[i].second;
+void BuildHullFromSorted(const std::vector<Pt> &sorted, const Pt &pivot, std::vector<Pt> &hull) {
+  hull.clear();
+  hull.push_back(pivot);
+  for (const auto &p : sorted) {
+    while (hull.size() >= 2 && CrossProduct(hull[hull.size() - 2], hull.back(), p) <= 0.0) {
+      hull.pop_back();
+    }
+    hull.push_back(p);
   }
 }
 
-void UnflattenInto(const std::vector<double> &flat, std::vector<Pt> &pts) {
-  pts.resize(flat.size() / 2);
-  const int n = static_cast<int>(pts.size());
-#pragma omp parallel for default(none) shared(flat, pts, n) num_threads(ppc::util::GetNumThreads())
-  for (int i = 0; i < n; i++) {
-    pts[static_cast<size_t>(i)] = {flat[static_cast<size_t>(i) * 2], flat[(static_cast<size_t>(i) * 2) + 1]};
+void MergeTwoSlices(Slice left, Slice right, const Pt &pivot, std::vector<Pt> &out) {
+  out.clear();
+  out.reserve(static_cast<size_t>((left.end - left.begin) + (right.end - right.begin)));
+
+  const Pt *i = left.begin;
+  const Pt *j = right.begin;
+  while (i < left.end && j < right.end) {
+    if (AngleLessSeq(*i, *j, pivot)) {
+      out.push_back(*i++);
+    } else {
+      out.push_back(*j++);
+    }
+  }
+  while (i < left.end) {
+    out.push_back(*i++);
+  }
+  while (j < right.end) {
+    out.push_back(*j++);
   }
 }
 
-int TotalPointCount(int n_input) {
-  if (n_input <= 0) {
-    return 0;
+void MergeBlocksFromGathered(const std::vector<Pt> &gathered, const std::vector<int> &displs,
+                             const std::vector<int> &counts, int left, int right, const Pt &pivot,
+                             std::vector<Pt> &out, WorkBuffers &bufs) {
+  if (right - left <= 0) {
+    out.clear();
+    return;
   }
-  return n_input + (n_input > 3 ? 1 : 0);
+  if (right - left == 1) {
+    const int displ = displs[static_cast<size_t>(left)];
+    const int count = counts[static_cast<size_t>(left)];
+    out.assign(gathered.begin() + displ, gathered.begin() + displ + count);
+    return;
+  }
+
+  const int mid = left + ((right - left) / 2);
+  MergeBlocksFromGathered(gathered, displs, counts, left, mid, pivot, bufs.merge_left, bufs);
+  MergeBlocksFromGathered(gathered, displs, counts, mid, right, pivot, bufs.merge_right, bufs);
+
+  MergeTwoSlices({bufs.merge_left.data(), bufs.merge_left.data() + bufs.merge_left.size()},
+                 {bufs.merge_right.data(), bufs.merge_right.data() + bufs.merge_right.size()}, pivot, out);
 }
 
-struct WorkBuffers {
-  std::vector<double> flat_all;
-  std::vector<double> local_flat;
-  std::vector<double> hull_flat;
-  std::vector<double> gathered_flat;
-  std::vector<double> result_flat;
-  std::vector<Pt> local_pts;
-  std::vector<Pt> merged_pts;
-};
+void RemovePaddingPoints(std::vector<Pt> &pts) {
+  auto end_it = std::remove_if(pts.begin(), pts.end(), [](const Pt &p) { return p.first > kPaddingMarker / 10.0; });
+  pts.erase(end_it, pts.end());
+}
 
-WorkBuffers &GetWorkBuffers() {
-  static thread_local WorkBuffers buffers;
-  return buffers;
+void BcastHullSize(std::vector<Pt> &hull, int rank) {
+  int hull_size = (rank == 0) ? static_cast<int>(hull.size()) : 0;
+  MPI_Bcast(&hull_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  hull.resize(static_cast<size_t>(hull_size));
 }
 
 }  // namespace
@@ -227,30 +285,23 @@ bool DergachevAGrahamScanALL::RunImpl() {
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-  const int n_input = GetInput();
-  int n = TotalPointCount(n_input);
-  MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  const MPI_Datatype mpi_point = GetMpiPointType();
 
-  if (n <= 1) {
+  int original_size = 0;
+  int padded_size = 0;
+  if (rank == 0) {
+    original_size = static_cast<int>(points_.size());
+    const int remainder = original_size % world_size;
+    padded_size = original_size + ((remainder == 0) ? 0 : (world_size - remainder));
+  }
+  MPI_Bcast(&original_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  MPI_Bcast(&padded_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+  if (original_size <= 1) {
     if (rank == 0 && !points_.empty()) {
       hull_.push_back(points_[0]);
     }
-    int hull_size = static_cast<int>(hull_.size());
-    MPI_Bcast(&hull_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if (rank != 0 && hull_size == 1) {
-      hull_.assign(1, Pt{});
-    }
-    if (hull_size == 1) {
-      std::vector<double> pt_flat(2);
-      if (rank == 0) {
-        pt_flat[0] = hull_[0].first;
-        pt_flat[1] = hull_[0].second;
-      }
-      MPI_Bcast(pt_flat.data(), 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-      if (rank != 0) {
-        hull_[0] = {pt_flat[0], pt_flat[1]};
-      }
-    }
+    BcastHullSize(hull_, rank);
     return true;
   }
 
@@ -258,94 +309,116 @@ bool DergachevAGrahamScanALL::RunImpl() {
   if (rank == 0) {
     all_same = std::all_of(points_.begin() + 1, points_.end(),
                            [&](const Pt &p) { return p.first == points_[0].first && p.second == points_[0].second; })
-                   ? 1
-                   : 0;
+                     ? 1
+                     : 0;
   }
   MPI_Bcast(&all_same, 1, MPI_INT, 0, MPI_COMM_WORLD);
   if (all_same != 0) {
     if (rank == 0) {
       hull_.push_back(points_[0]);
     }
-    int hull_size = 1;
-    MPI_Bcast(&hull_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    hull_.resize(static_cast<size_t>(hull_size));
-    auto &buffers = GetWorkBuffers();
-    buffers.result_flat.resize(2);
-    if (rank == 0) {
-      buffers.result_flat[0] = hull_[0].first;
-      buffers.result_flat[1] = hull_[0].second;
-    }
-    MPI_Bcast(buffers.result_flat.data(), 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    if (rank != 0) {
-      hull_[0] = {buffers.result_flat[0], buffers.result_flat[1]};
-    }
+    BcastHullSize(hull_, rank);
     return true;
   }
 
   if (world_size == 1) {
-    BuildHull(points_, hull_);
+    BuildHullSequential(points_, hull_);
     return true;
   }
 
-  auto &buffers = GetWorkBuffers();
-  std::vector<int> send_counts(world_size);
-  std::vector<int> send_displs(world_size);
-  int disp = 0;
-  for (int i = 0; i < world_size; i++) {
-    int chunk = (n / world_size) + ((i < (n % world_size)) ? 1 : 0);
-    send_counts[i] = chunk * 2;
-    send_displs[i] = disp;
-    disp += send_counts[i];
+  thread_local WorkBuffers bufs;
+  const int block_size = padded_size / world_size;
+
+  bufs.counts.assign(static_cast<size_t>(world_size), block_size);
+  bufs.displs.resize(static_cast<size_t>(world_size));
+  bufs.recv_counts.resize(static_cast<size_t>(world_size));
+  bufs.recv_displs.resize(static_cast<size_t>(world_size));
+  for (int i = 0, offset = 0; i < world_size; i++) {
+    bufs.displs[static_cast<size_t>(i)] = offset;
+    offset += block_size;
   }
 
   if (rank == 0) {
-    FlattenInto(points_, buffers.flat_all);
-  }
-
-  const int local_size = send_counts[rank];
-  buffers.local_flat.resize(static_cast<size_t>(local_size));
-  MPI_Scatterv(rank == 0 ? buffers.flat_all.data() : nullptr, send_counts.data(), send_displs.data(), MPI_DOUBLE,
-               buffers.local_flat.data(), local_size, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-  UnflattenInto(buffers.local_flat, buffers.local_pts);
-  std::vector<Pt> local_hull;
-  BuildHull(buffers.local_pts, local_hull);
-
-  const int local_hull_flat_size = static_cast<int>(local_hull.size()) * 2;
-  std::vector<int> recv_counts(world_size);
-  MPI_Gather(&local_hull_flat_size, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-  std::vector<int> recv_displs(world_size);
-  int total_recv = 0;
-  if (rank == 0) {
-    for (int i = 0; i < world_size; i++) {
-      recv_displs[i] = total_recv;
-      total_recv += recv_counts[i];
+    bufs.padded_input = points_;
+    if (padded_size > original_size) {
+      bufs.padded_input.resize(static_cast<size_t>(padded_size), Pt{kPaddingMarker, kPaddingMarker});
     }
   }
 
-  FlattenInto(local_hull, buffers.hull_flat);
-  buffers.gathered_flat.resize(static_cast<size_t>(total_recv));
-  MPI_Gatherv(buffers.hull_flat.data(), local_hull_flat_size, MPI_DOUBLE, buffers.gathered_flat.data(),
-              recv_counts.data(), recv_displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+  bufs.local_data.resize(static_cast<size_t>(block_size));
+  MPI_Scatterv(rank == 0 ? bufs.padded_input.data() : nullptr, bufs.counts.data(), bufs.displs.data(), mpi_point,
+               bufs.local_data.data(), block_size, mpi_point, 0, MPI_COMM_WORLD);
+
+  RemovePaddingPoints(bufs.local_data);
+
+  const int local_pivot_idx = FindLocalPivotIndex(bufs.local_data);
+  Pt local_pivot =
+      bufs.local_data.empty() ? Pt{kPaddingMarker, kPaddingMarker} : bufs.local_data[static_cast<size_t>(local_pivot_idx)];
 
   if (rank == 0) {
-    UnflattenInto(buffers.gathered_flat, buffers.merged_pts);
-    BuildHull(buffers.merged_pts, hull_);
+    bufs.gathered_pivots.resize(static_cast<size_t>(world_size));
   }
+  MPI_Gather(&local_pivot, 1, mpi_point, rank == 0 ? bufs.gathered_pivots.data() : nullptr, 1, mpi_point, 0,
+             MPI_COMM_WORLD);
 
-  int hull_size = static_cast<int>(hull_.size());
-  MPI_Bcast(&hull_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
-  hull_.resize(static_cast<size_t>(hull_size));
-  buffers.result_flat.resize(static_cast<size_t>(hull_size) * 2);
+  Pt global_pivot{kPaddingMarker, kPaddingMarker};
   if (rank == 0) {
-    FlattenInto(hull_, buffers.result_flat);
+    global_pivot = bufs.gathered_pivots[0];
+    for (int i = 1; i < world_size; i++) {
+      if (IsLowerLeft(bufs.gathered_pivots[static_cast<size_t>(i)], global_pivot)) {
+        global_pivot = bufs.gathered_pivots[static_cast<size_t>(i)];
+      }
+    }
   }
-  MPI_Bcast(buffers.result_flat.data(), hull_size * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-  if (rank != 0) {
-    UnflattenInto(buffers.result_flat, hull_);
+  MPI_Bcast(&global_pivot, 1, mpi_point, 0, MPI_COMM_WORLD);
+
+  int owner_rank = -1;
+  if (local_pivot == global_pivot) {
+    owner_rank = rank;
+  }
+  int pivot_owner = -1;
+  MPI_Allreduce(&owner_rank, &pivot_owner, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  if (rank == pivot_owner) {
+    auto it = std::ranges::find(bufs.local_data, global_pivot);
+    if (it != bufs.local_data.end()) {
+      bufs.local_data.erase(it);
+    }
   }
 
+  ParallelSortRange(bufs.local_data.begin(), bufs.local_data.end(), global_pivot);
+
+  const int local_size = static_cast<int>(bufs.local_data.size());
+  MPI_Gather(&local_size, 1, MPI_INT, rank == 0 ? bufs.recv_counts.data() : nullptr, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+  if (rank == 0) {
+    int offset = 0;
+    for (int i = 0; i < world_size; i++) {
+      bufs.recv_displs[static_cast<size_t>(i)] = offset;
+      offset += bufs.recv_counts[static_cast<size_t>(i)];
+    }
+    bufs.gathered.resize(static_cast<size_t>(offset));
+  }
+
+  MPI_Gatherv(bufs.local_data.data(), local_size, mpi_point, rank == 0 ? bufs.gathered.data() : nullptr,
+              rank == 0 ? bufs.recv_counts.data() : nullptr, rank == 0 ? bufs.recv_displs.data() : nullptr, mpi_point,
+              0, MPI_COMM_WORLD);
+
+  if (rank == 0) {
+    if (world_size == 2) {
+      const int d0 = bufs.recv_displs[0];
+      const int c0 = bufs.recv_counts[0];
+      const int d1 = bufs.recv_displs[1];
+      const int c1 = bufs.recv_counts[1];
+      MergeTwoSlices({bufs.gathered.data() + d0, bufs.gathered.data() + d0 + c0},
+                     {bufs.gathered.data() + d1, bufs.gathered.data() + d1 + c1}, global_pivot, bufs.sorted);
+    } else {
+      MergeBlocksFromGathered(bufs.gathered, bufs.recv_displs, bufs.recv_counts, 0, world_size, global_pivot,
+                              bufs.sorted, bufs);
+    }
+    BuildHullFromSorted(bufs.sorted, global_pivot, hull_);
+  }
+
+  BcastHullSize(hull_, rank);
   return true;
 }
 
