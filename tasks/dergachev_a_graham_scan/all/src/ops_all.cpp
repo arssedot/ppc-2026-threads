@@ -66,14 +66,8 @@ double DistSquared(const Pt &a, const Pt &b) {
 }
 
 bool AngleLessSeq(const Pt &a, const Pt &b, const Pt &pivot) {
-  double cross = CrossProduct(pivot, a, b);
-  if (cross > 0.0) {
-    return true;
-  }
-  if (cross < 0.0) {
-    return false;
-  }
-  return DistSquared(pivot, a) < DistSquared(pivot, b);
+  const double cross = CrossProduct(pivot, a, b);
+  return cross > 0.0 || (cross == 0.0 && DistSquared(pivot, a) < DistSquared(pivot, b));
 }
 
 int FindLocalPivotIndex(const std::vector<Pt> &pts) {
@@ -143,34 +137,6 @@ void ParallelSortRange(std::vector<Pt>::iterator begin, std::vector<Pt>::iterato
   }
 }
 
-void BuildHullSequential(std::vector<Pt> &pts, std::vector<Pt> &hull) {
-  hull.clear();
-  const int n = static_cast<int>(pts.size());
-  if (n <= 1) {
-    if (!pts.empty()) {
-      hull.push_back(pts[0]);
-    }
-    return;
-  }
-  if (std::all_of(pts.begin() + 1, pts.end(),
-                  [&](const Pt &p) { return p.first == pts[0].first && p.second == pts[0].second; })) {
-    hull.push_back(pts[0]);
-    return;
-  }
-
-  const int pivot_idx = FindLocalPivotIndex(pts);
-  std::swap(pts[0], pts[pivot_idx]);
-  const Pt pivot = pts[0];
-  ParallelSortRange(pts.begin() + 1, pts.end(), pivot);
-
-  for (const auto &p : pts) {
-    while (hull.size() >= 2 && CrossProduct(hull[hull.size() - 2], hull.back(), p) <= 0.0) {
-      hull.pop_back();
-    }
-    hull.push_back(p);
-  }
-}
-
 void BuildHullFromSorted(const std::vector<Pt> &sorted, const Pt &pivot, std::vector<Pt> &hull) {
   hull.clear();
   hull.push_back(pivot);
@@ -210,10 +176,6 @@ Slice MakeSlice(const std::vector<Pt> &data, int displ, int count) {
 std::vector<Pt> MergeAllBlocks(const std::vector<Pt> &gathered, const std::vector<int> &displs,
                                const std::vector<int> &counts, int world_size, const Pt &pivot,
                                std::vector<Pt> &merge_temp) {
-  if (world_size <= 0) {
-    return {};
-  }
-
   const int first_displ = displs[0];
   const int first_count = counts[0];
   std::vector<Pt> merged(gathered.begin() + first_displ, gathered.begin() + first_displ + first_count);
@@ -434,22 +396,13 @@ bool DergachevAGrahamScanALL::RunImpl() {
   MPI_Bcast(&original_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
   MPI_Bcast(&padded_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-  if (HandleTrivialCases(rank, original_size, 0, points_, hull_)) {
-    return true;
-  }
-
   int all_same = 0;
-  if (rank == 0) {
+  if (rank == 0 && original_size > 1) {
     all_same = AllPointsSame(points_) ? 1 : 0;
   }
   MPI_Bcast(&all_same, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
   if (HandleTrivialCases(rank, original_size, all_same, points_, hull_)) {
-    return true;
-  }
-
-  if (world_size == 1) {
-    BuildHullSequential(points_, hull_);
     return true;
   }
 
