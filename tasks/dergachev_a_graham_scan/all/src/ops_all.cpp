@@ -205,8 +205,8 @@ void MergeTwoSlices(Slice left, Slice right, const Pt &pivot, std::vector<Pt> &o
 }
 
 void MergeBlocksFromGathered(const std::vector<Pt> &gathered, const std::vector<int> &displs,
-                             const std::vector<int> &counts, int left, int right, const Pt &pivot,
-                             std::vector<Pt> &out, WorkBuffers &bufs) {
+                             const std::vector<int> &counts, int left, int right, const Pt &pivot, std::vector<Pt> &out,
+                             WorkBuffers &bufs) {
   if (right - left <= 0) {
     out.clear();
     return;
@@ -309,8 +309,8 @@ bool DergachevAGrahamScanALL::RunImpl() {
   if (rank == 0) {
     all_same = std::all_of(points_.begin() + 1, points_.end(),
                            [&](const Pt &p) { return p.first == points_[0].first && p.second == points_[0].second; })
-                     ? 1
-                     : 0;
+                   ? 1
+                   : 0;
   }
   MPI_Bcast(&all_same, 1, MPI_INT, 0, MPI_COMM_WORLD);
   if (all_same != 0) {
@@ -352,8 +352,8 @@ bool DergachevAGrahamScanALL::RunImpl() {
   RemovePaddingPoints(bufs.local_data);
 
   const int local_pivot_idx = FindLocalPivotIndex(bufs.local_data);
-  Pt local_pivot =
-      bufs.local_data.empty() ? Pt{kPaddingMarker, kPaddingMarker} : bufs.local_data[static_cast<size_t>(local_pivot_idx)];
+  Pt local_pivot = bufs.local_data.empty() ? Pt{kPaddingMarker, kPaddingMarker}
+                                           : bufs.local_data[static_cast<size_t>(local_pivot_idx)];
 
   if (rank == 0) {
     bufs.gathered_pivots.resize(static_cast<size_t>(world_size));
