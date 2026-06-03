@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <utility>
 #include <vector>
 
@@ -62,26 +63,10 @@ void SortByAngle(std::vector<Pt> &pts, const Pt &pivot) {
     return;
   }
 
-  if (num_threads == 2) {
-    const int mid = 1 + (sort_count / 2);
-#pragma omp parallel sections num_threads(2)
-    {
-#pragma omp section
-      {
-        std::sort(pts.begin() + 1, pts.begin() + mid, cmp);
-      }
-#pragma omp section
-      {
-        std::sort(pts.begin() + mid, pts.end(), cmp);
-      }
-    }
-    std::inplace_merge(pts.begin() + 1, pts.begin() + mid, pts.end(), cmp);
-    return;
-  }
-
   const int chunk = sort_count / num_threads;
-#pragma omp parallel for schedule(static) num_threads(num_threads)
-  for (int tid = 0; tid < num_threads; tid++) {
+#pragma omp parallel num_threads(num_threads) default(none) shared(pts, n, chunk, cmp, num_threads)
+  {
+    const int tid = omp_get_thread_num();
     const int lo = 1 + (tid * chunk);
     const int hi = (tid == num_threads - 1) ? n : 1 + ((tid + 1) * chunk);
     std::sort(pts.begin() + lo, pts.begin() + hi, cmp);
